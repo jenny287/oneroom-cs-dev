@@ -1542,15 +1542,17 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
     // "메모 확인"인 경우 fee를 null로 강제
     const fee = shipping.cond==='메모 확인' ? null : (shipping.fee===''||shipping.fee==null?null:Number(shipping.fee));
     const threshold = shipping.cond==='금액 조건부 무료' ? (shipping.threshold===''||shipping.threshold==null?null:Number(shipping.threshold)) : null;
+    // 메모는 '메모 확인' 또는 '수량별 차등'인 경우에만 저장
+    const memo = (shipping.cond==='메모 확인'||shipping.cond==='수량별 차등') ? (shipping.memo||null) : null;
     const payload = {
       name,
       default_shipping_fee: fee,
       default_shipping_cond: shipping.cond||null,
       default_shipping_threshold: threshold,
-      shipping_memo: shipping.memo||null,
+      shipping_memo: memo,
       updated_at: new Date().toISOString(),
     };
-    setSupShipMap(prev=>({...prev,[name]:{fee,cond:shipping.cond||'',threshold,memo:shipping.memo||''}}));
+    setSupShipMap(prev=>({...prev,[name]:{fee,cond:shipping.cond||'',threshold,memo:memo||''}}));
     const{error}=await sb.from('suppliers').upsert(payload,{onConflict:'name'});
     setSupShipSaving(null);
     if(error){alert('배송비 저장 실패: '+error.message); loadSuppliers();}
@@ -2881,7 +2883,7 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                       </div>
                     ):(
                       <div style={{display:'grid',gridTemplateColumns:'180px 150px 110px 110px 1fr 80px',gap:10,padding:'10px 14px',background:'#162244',color:'var(--sub)',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'.04em',borderBottom:'1px solid var(--border)'}}>
-                        <span>공급사명</span><span>배송 조건</span><span>배송비(원)</span><span>무료기준(원)</span><span>메모</span><span>저장</span>
+                        <span>공급사명</span><span>배송 조건</span><span>배송비(원)</span><span>구매 금액 조건(원)</span><span>메모</span><span>저장</span>
                       </div>
                     )}
                     {/* 탭별 행 */}
@@ -2928,7 +2930,7 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                       };
                       const isDirty = !!edit;
                       const isSaving = supShipSaving===name;
-                      const memoDisabled = cur.cond!=='메모 확인';
+                      const memoEnabled = cur.cond==='메모 확인' || cur.cond==='수량별 차등';
                       const feeDisabled = cur.cond==='메모 확인';
                       const thresholdEnabled = cur.cond==='금액 조건부 무료';
                       const updateEdit=(patch)=>setSupShipEdit(prev=>({...prev,[name]:{...cur,...patch}}));
@@ -2937,6 +2939,8 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                         const patch={cond:newCond};
                         if(newCond==='메모 확인') patch.fee='';
                         if(newCond!=='금액 조건부 무료') patch.threshold='';
+                        // 메모도 비활성 조건이면 비움
+                        if(newCond!=='메모 확인' && newCond!=='수량별 차등') patch.memo='';
                         updateEdit(patch);
                       };
                       return (
@@ -2954,9 +2958,10 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                             onChange={e=>updateEdit({threshold:e.target.value})}
                             placeholder={thresholdEnabled?'예: 50000':'-'}
                             style={{padding:'5px 8px',background:!thresholdEnabled?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
-                          <input type="text" value={cur.memo} onChange={e=>updateEdit({memo:e.target.value})}
-                            placeholder={cur.cond==='수량별 차등'||cur.cond==='메모 확인'?'예: 1~3개 3000원, 4~6개 6000원':'(선택) 메모'}
-                            style={{padding:'5px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                          <input type="text" value={memoEnabled?cur.memo:''} disabled={!memoEnabled}
+                            onChange={e=>updateEdit({memo:e.target.value})}
+                            placeholder={memoEnabled?'예: 1~3개 3000원, 4~6개 6000원':'-'}
+                            style={{padding:'5px 8px',background:!memoEnabled?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
                           <button disabled={!isDirty||isSaving}
                             onClick={()=>setSupplierShipping(name,cur)}
                             style={{padding:'5px 8px',background:isDirty?'#2A478D':'var(--bg)',border:'1px solid '+(isDirty?'#2A478D':'var(--border)'),borderRadius:4,color:isDirty?'#fff':'var(--sub)',fontSize:10,fontWeight:700,cursor:isDirty&&!isSaving?'pointer':'default',fontFamily:'inherit',opacity:isSaving?0.5:1}}>
