@@ -1542,8 +1542,9 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
     // "메모 확인"인 경우 fee를 null로 강제
     const fee = shipping.cond==='메모 확인' ? null : (shipping.fee===''||shipping.fee==null?null:Number(shipping.fee));
     const threshold = shipping.cond==='금액 조건부 무료' ? (shipping.threshold===''||shipping.threshold==null?null:Number(shipping.threshold)) : null;
-    // 메모는 '메모 확인' 또는 '수량별 차등'인 경우에만 저장
-    const memo = (shipping.cond==='메모 확인'||shipping.cond==='수량별 차등') ? (shipping.memo||null) : null;
+    // 메모는 단일 숫자로 표현 못하는 복잡한 조건들에서만 저장
+    const memoConds = ['메모 확인','수량별 차등','금액별 차등','무게별 차등'];
+    const memo = memoConds.includes(shipping.cond) ? (shipping.memo||null) : null;
     const payload = {
       name,
       default_shipping_fee: fee,
@@ -2818,7 +2819,7 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
         };
         // 배송비 cond별 카운트
         const shipCondCounts={};
-        const SUP_SHIP_CONDS=['무료','고정 배송비','금액 조건부 무료','수량 비례','수량별 차등','메모 확인'];
+        const SUP_SHIP_CONDS=['무료','고정 배송비','금액 조건부 무료','수량 비례','수량별 차등','금액별 차등','무게별 차등','메모 확인'];
         SUP_SHIP_CONDS.forEach(c=>{shipCondCounts[c]=0;});
         let unsetCount=0;
         list.forEach(n=>{
@@ -2930,7 +2931,8 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                       };
                       const isDirty = !!edit;
                       const isSaving = supShipSaving===name;
-                      const memoEnabled = cur.cond==='메모 확인' || cur.cond==='수량별 차등';
+                      // 메모 활성화: 단일 숫자로 표현 못하는 복잡한 조건들
+                      const memoEnabled = cur.cond==='메모 확인' || cur.cond==='수량별 차등' || cur.cond==='금액별 차등' || cur.cond==='무게별 차등';
                       const feeDisabled = cur.cond==='메모 확인';
                       const thresholdEnabled = cur.cond==='금액 조건부 무료';
                       const updateEdit=(patch)=>setSupShipEdit(prev=>({...prev,[name]:{...cur,...patch}}));
@@ -2939,8 +2941,9 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                         const patch={cond:newCond};
                         if(newCond==='메모 확인') patch.fee='';
                         if(newCond!=='금액 조건부 무료') patch.threshold='';
-                        // 메모도 비활성 조건이면 비움
-                        if(newCond!=='메모 확인' && newCond!=='수량별 차등') patch.memo='';
+                        // 메모 활성화 조건이 아니면 메모 비움
+                        const newMemoEnabled = newCond==='메모 확인'||newCond==='수량별 차등'||newCond==='금액별 차등'||newCond==='무게별 차등';
+                        if(!newMemoEnabled) patch.memo='';
                         updateEdit(patch);
                       };
                       return (
@@ -2960,7 +2963,13 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
                             style={{padding:'5px 8px',background:!thresholdEnabled?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
                           <input type="text" value={memoEnabled?cur.memo:''} disabled={!memoEnabled}
                             onChange={e=>updateEdit({memo:e.target.value})}
-                            placeholder={memoEnabled?'예: 1~3개 3000원, 4~6개 6000원':'-'}
+                            placeholder={
+                              cur.cond==='수량별 차등' ? '예: 1~3개 3000원, 4~6개 6000원' :
+                              cur.cond==='금액별 차등' ? '예: 5만원 미만 3000원, 5~10만원 2000원' :
+                              cur.cond==='무게별 차등' ? '예: 1kg 이하 3000원, 1~5kg 5000원' :
+                              cur.cond==='메모 확인' ? '직접 메모 입력' :
+                              '-'
+                            }
                             style={{padding:'5px 8px',background:!memoEnabled?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
                           <button disabled={!isDirty||isSaving}
                             onClick={()=>setSupplierShipping(name,cur)}
