@@ -1487,6 +1487,10 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
   const [supModal,setSupModal]=useState(false); // 공급사 관리 모달
   const [supModalSearch,setSupModalSearch]=useState('');
   const [supModalFilter,setSupModalFilter]=useState('all'); // all|kakao|nateon|email|none
+  const [supModalTab,setSupModalTab]=useState('channels'); // channels | shipping
+  const [supShipMap,setSupShipMap]=useState({}); // { name: {fee,cond,threshold,memo} }
+  const [supShipEdit,setSupShipEdit]=useState({}); // 인라인 편집 임시 상태 { name: {fee,cond,threshold,memo} }
+  const [supShipSaving,setSupShipSaving]=useState(null); // 저장 중인 공급사명
   const [labelPopover,setLabelPopover]=useState(null); // {name, anchorId} — 라벨 클릭 인라인 팝오버
   // ── 이미지 마이그레이션 (base64 → Storage) — master 전용 일회성 도구
   const [migModal,setMigModal]=useState(false);
@@ -1505,9 +1509,20 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
     return SUP_CHANNELS[ch]||SUP_CHANNELS.none;
   };
   const loadSuppliers=async()=>{
-    const{data}=await sb.from('suppliers').select('name,channel');
+    const{data}=await sb.from('suppliers').select('name,channel,default_shipping_fee,default_shipping_cond,default_shipping_threshold,shipping_memo');
     if(data){
-      const m={}; data.forEach(s=>{m[s.name]=s.channel||null;}); setSupplierMap(m);
+      const m={}; const sm={};
+      data.forEach(s=>{
+        m[s.name]=s.channel||null;
+        sm[s.name]={
+          fee: s.default_shipping_fee,
+          cond: s.default_shipping_cond||'',
+          threshold: s.default_shipping_threshold,
+          memo: s.shipping_memo||'',
+        };
+      });
+      setSupplierMap(m);
+      setSupShipMap(sm);
     }
   };
   // 공급사 채널 변경 (즉시 저장) — admin/manager만 가능
@@ -1517,6 +1532,32 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
     setSupplierMap(prev=>({...prev,[name]:channel})); // 낙관적 갱신
     const{error}=await sb.from('suppliers').upsert({name,channel,updated_at:new Date().toISOString()},{onConflict:'name'});
     if(error){alert('채널 저장 실패: '+error.message); loadSuppliers();}
+  };
+  // 공급사 기본 배송비 저장 — master/manager만 가능
+  // shipping = {fee, cond, threshold, memo}
+  const setSupplierShipping=async(name,shipping)=>{
+    if(!name) return;
+    if(!canManageSupplier){alert('공급사 배송비 변경 권한이 없습니다. 관리자(master) 또는 매니저(manager)만 변경할 수 있습니다.'); return;}
+    setSupShipSaving(name);
+    // "메모 확인"인 경우 fee를 null로 강제
+    const fee = shipping.cond==='메모 확인' ? null : (shipping.fee===''||shipping.fee==null?null:Number(shipping.fee));
+    const threshold = shipping.cond==='금액 조건부 무료' ? (shipping.threshold===''||shipping.threshold==null?null:Number(shipping.threshold)) : null;
+    const payload = {
+      name,
+      default_shipping_fee: fee,
+      default_shipping_cond: shipping.cond||null,
+      default_shipping_threshold: threshold,
+      shipping_memo: shipping.memo||null,
+      updated_at: new Date().toISOString(),
+    };
+    setSupShipMap(prev=>({...prev,[name]:{fee,cond:shipping.cond||'',threshold,memo:shipping.memo||''}}));
+    const{error}=await sb.from('suppliers').upsert(payload,{onConflict:'name'});
+    setSupShipSaving(null);
+    if(error){alert('배송비 저장 실패: '+error.message); loadSuppliers();}
+    else{
+      // 편집 임시 상태 정리 (저장 완료된 항목)
+      setSupShipEdit(prev=>{const n={...prev}; delete n[name]; return n;});
+    }
   };
   // 신규 공급사 자동 등록 (channel=null)
   const ensureSupplier=async(name)=>{
@@ -2755,9 +2796,16 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
         const list=[...allNames].sort((a,b)=>a.localeCompare(b,'ko'));
         const filtered=list.filter(n=>{
           if(supModalSearch&&!n.toLowerCase().includes(supModalSearch.toLowerCase())) return false;
-          const ch=supplierMap[n]||'none';
+          if(supModalTab==='channels'){
+            const ch=supplierMap[n]||'none';
+            if(supModalFilter==='all') return true;
+            return ch===supModalFilter || (supModalFilter==='none'&&!supplierMap[n]);
+          }
+          // shipping 탭에서는 cond 필터를 사용
           if(supModalFilter==='all') return true;
-          return ch===supModalFilter || (supModalFilter==='none'&&!supplierMap[n]);
+          const ship=supShipMap[n]||{};
+          if(supModalFilter==='unset') return !ship.cond;
+          return ship.cond===supModalFilter;
         });
         const counts={
           all:list.length,
@@ -2766,62 +2814,154 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
           email:list.filter(n=>supplierMap[n]==='email').length,
           none:list.filter(n=>!supplierMap[n]).length,
         };
+        // 배송비 cond별 카운트
+        const shipCondCounts={};
+        const SUP_SHIP_CONDS=['무료','고정 배송비','금액 조건부 무료','수량 비례','수량별 차등','메모 확인'];
+        SUP_SHIP_CONDS.forEach(c=>{shipCondCounts[c]=0;});
+        let unsetCount=0;
+        list.forEach(n=>{
+          const c=(supShipMap[n]||{}).cond;
+          if(!c) unsetCount++;
+          else if(shipCondCounts[c]!==undefined) shipCondCounts[c]++;
+        });
+        // 탭별 헤더 설명
+        const tabDesc = supModalTab==='channels'
+          ? `총 ${counts.all}개 공급사 · 채널 변경 시 즉시 저장됩니다`
+          : `총 ${counts.all}개 공급사 · "저장" 버튼 클릭 시 반영됩니다`;
         return (
           <div onClick={()=>setSupModal(false)} style={{position:'fixed',top:0,left:0,width:'100vw',height:'100vh',background:'rgba(0,0,0,.7)',zIndex:1900,display:'flex',alignItems:'center',justifyContent:'center'}}>
-            <div onClick={e=>e.stopPropagation()} style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:14,width:820,maxWidth:'94vw',maxHeight:'88vh',display:'flex',flexDirection:'column',overflow:'hidden'}}>
+            <div onClick={e=>e.stopPropagation()} style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:14,width:supModalTab==='shipping'?1100:820,maxWidth:'94vw',maxHeight:'88vh',display:'flex',flexDirection:'column',overflow:'hidden'}}>
               <div style={{padding:'16px 22px',background:'#162244',borderBottom:'1px solid var(--border)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
                 <div>
-                  <div style={{fontSize:15,fontWeight:700,color:'#fff'}}>공급사 소통 채널 관리</div>
-                  <div style={{fontSize:11,color:'var(--sub)',marginTop:3}}>총 {counts.all}개 공급사 · 채널 변경 시 즉시 저장됩니다</div>
+                  <div style={{fontSize:15,fontWeight:700,color:'#fff'}}>공급사 관리</div>
+                  <div style={{fontSize:11,color:'var(--sub)',marginTop:3}}>{tabDesc}</div>
                 </div>
                 <button onClick={()=>setSupModal(false)} style={{background:'none',border:'none',color:'var(--sub)',fontSize:20,cursor:'pointer'}}>✕</button>
+              </div>
+              {/* 탭 헤더 */}
+              <div style={{display:'flex',background:'#0f1933',borderBottom:'1px solid var(--border)'}}>
+                {[{k:'channels',label:'💬 채널 관리'},{k:'shipping',label:'🚚 배송비 관리'}].map(tab=>(
+                  <button key={tab.k}
+                    onClick={()=>{setSupModalTab(tab.k); setSupModalFilter('all'); setSupShipEdit({});}}
+                    style={{flex:'0 0 auto',padding:'12px 24px',background:supModalTab===tab.k?'#162244':'transparent',border:'none',borderBottom:supModalTab===tab.k?'2px solid var(--accent)':'2px solid transparent',color:supModalTab===tab.k?'#fff':'var(--sub)',fontSize:13,fontWeight:600,cursor:'pointer',fontFamily:'inherit',transition:'all .15s'}}>
+                    {tab.label}
+                  </button>
+                ))}
               </div>
               <div style={{padding:'14px 22px',display:'flex',gap:8,borderBottom:'1px solid var(--border)'}}>
                 <input type="text" placeholder="공급사명 검색..." value={supModalSearch} onChange={e=>setSupModalSearch(e.target.value)}
                   style={{flex:1,padding:'8px 12px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit',outline:'none'}}/>
-                <select value={supModalFilter} onChange={e=>setSupModalFilter(e.target.value)}
-                  style={{padding:'8px 10px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit'}}>
-                  <option value="all">전체 ({counts.all})</option>
-                  <option value="kakao">카카오톡 ({counts.kakao})</option>
-                  <option value="nateon">네이트온 ({counts.nateon})</option>
-                  <option value="email">메일 ({counts.email})</option>
-                  <option value="none">미설정 ({counts.none})</option>
-                </select>
+                {supModalTab==='channels'?(
+                  <select value={supModalFilter} onChange={e=>setSupModalFilter(e.target.value)}
+                    style={{padding:'8px 10px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit'}}>
+                    <option value="all">전체 ({counts.all})</option>
+                    <option value="kakao">카카오톡 ({counts.kakao})</option>
+                    <option value="nateon">네이트온 ({counts.nateon})</option>
+                    <option value="email">메일 ({counts.email})</option>
+                    <option value="none">미설정 ({counts.none})</option>
+                  </select>
+                ):(
+                  <select value={supModalFilter} onChange={e=>setSupModalFilter(e.target.value)}
+                    style={{padding:'8px 10px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit'}}>
+                    <option value="all">전체 ({counts.all})</option>
+                    <option value="unset">미설정 ({unsetCount})</option>
+                    {SUP_SHIP_CONDS.map(c=>(
+                      <option key={c} value={c}>{c} ({shipCondCounts[c]})</option>
+                    ))}
+                  </select>
+                )}
               </div>
               <div style={{padding:'14px 22px',overflowY:'auto',flex:1}}>
                 {filtered.length===0?<div style={{textAlign:'center',color:'var(--sub)',fontSize:12,padding:30}}>해당하는 공급사가 없습니다</div>:(
                   <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,overflow:'hidden'}}>
-                    <div style={{display:'grid',gridTemplateColumns:'1fr 90px 320px',gap:12,padding:'10px 14px',background:'#162244',color:'var(--sub)',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'.04em',borderBottom:'1px solid var(--border)'}}>
-                      <span>공급사명</span><span>현재 채널</span><span>채널 변경</span>
-                    </div>
+                    {/* 탭별 컬럼 헤더 */}
+                    {supModalTab==='channels'?(
+                      <div style={{display:'grid',gridTemplateColumns:'1fr 90px 320px',gap:12,padding:'10px 14px',background:'#162244',color:'var(--sub)',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'.04em',borderBottom:'1px solid var(--border)'}}>
+                        <span>공급사명</span><span>현재 채널</span><span>채널 변경</span>
+                      </div>
+                    ):(
+                      <div style={{display:'grid',gridTemplateColumns:'180px 150px 110px 110px 1fr 80px',gap:10,padding:'10px 14px',background:'#162244',color:'var(--sub)',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'.04em',borderBottom:'1px solid var(--border)'}}>
+                        <span>공급사명</span><span>배송 조건</span><span>배송비(원)</span><span>무료기준(원)</span><span>메모</span><span>저장</span>
+                      </div>
+                    )}
+                    {/* 탭별 행 */}
                     {filtered.map(name=>{
-                      const cur=supplierMap[name]||'none';
-                      const curStyle=SUP_CHANNELS[cur];
+                      if(supModalTab==='channels'){
+                        const cur=supplierMap[name]||'none';
+                        const curStyle=SUP_CHANNELS[cur];
+                        return (
+                          <div key={name} style={{display:'grid',gridTemplateColumns:'1fr 90px 320px',gap:12,padding:'10px 14px',borderBottom:'1px solid var(--border)',alignItems:'center',fontSize:12}}>
+                            <span style={{color:'var(--text)',fontWeight:500}}>{name}</span>
+                            <span><span style={{display:'inline-block',padding:'2px 8px',background:curStyle.bg,color:curStyle.color,border:'1px solid '+curStyle.border,borderRadius:4,fontSize:10,fontWeight:700}}>{curStyle.label}</span></span>
+                            <span style={{display:'flex',gap:4}}>
+                              {['kakao','nateon','email','none'].map(ck=>{
+                                const cs=SUP_CHANNELS[ck];
+                                const active=cur===ck;
+                                return (
+                                  <button key={ck} onClick={()=>setSupplierChannel(name,ck==='none'?null:ck)}
+                                    title={cs.label}
+                                    style={{flex:1,display:'inline-flex',alignItems:'center',justifyContent:'center',gap:4,padding:'5px 6px',borderRadius:4,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit',whiteSpace:'nowrap',
+                                      background:active?cs.bg:'transparent',
+                                      color:active?cs.color:'var(--text)',
+                                      border:'1px solid '+(active?cs.border:'var(--border)'),
+                                      opacity:active?1:.85,
+                                      transition:'all .12s'}}
+                                    onMouseEnter={(e)=>{if(!active){e.currentTarget.style.background='var(--hover)';e.currentTarget.style.opacity='1';}}}
+                                    onMouseLeave={(e)=>{if(!active){e.currentTarget.style.background='transparent';e.currentTarget.style.opacity='.85';}}}>
+                                    <span style={{fontSize:12}}>{cs.icon}</span>
+                                    <span>{cs.label}</span>
+                                  </button>
+                                );
+                              })}
+                            </span>
+                          </div>
+                        );
+                      }
+                      // ── 배송비 관리 탭 ──
+                      const saved=supShipMap[name]||{};
+                      const edit=supShipEdit[name];
+                      const cur=edit||{
+                        cond:saved.cond||'',
+                        fee:saved.fee==null?'':saved.fee,
+                        threshold:saved.threshold==null?'':saved.threshold,
+                        memo:saved.memo||'',
+                      };
+                      const isDirty = !!edit;
+                      const isSaving = supShipSaving===name;
+                      const memoDisabled = cur.cond!=='메모 확인';
+                      const feeDisabled = cur.cond==='메모 확인';
+                      const thresholdEnabled = cur.cond==='금액 조건부 무료';
+                      const updateEdit=(patch)=>setSupShipEdit(prev=>({...prev,[name]:{...cur,...patch}}));
+                      // cond 변경 시 종속 필드 초기화 처리
+                      const onCondChange=(newCond)=>{
+                        const patch={cond:newCond};
+                        if(newCond==='메모 확인') patch.fee='';
+                        if(newCond!=='금액 조건부 무료') patch.threshold='';
+                        updateEdit(patch);
+                      };
                       return (
-                        <div key={name} style={{display:'grid',gridTemplateColumns:'1fr 90px 320px',gap:12,padding:'10px 14px',borderBottom:'1px solid var(--border)',alignItems:'center',fontSize:12}}>
-                          <span style={{color:'var(--text)',fontWeight:500}}>{name}</span>
-                          <span><span style={{display:'inline-block',padding:'2px 8px',background:curStyle.bg,color:curStyle.color,border:'1px solid '+curStyle.border,borderRadius:4,fontSize:10,fontWeight:700}}>{curStyle.label}</span></span>
-                          <span style={{display:'flex',gap:4}}>
-                            {['kakao','nateon','email','none'].map(ck=>{
-                              const cs=SUP_CHANNELS[ck];
-                              const active=cur===ck;
-                              return (
-                                <button key={ck} onClick={()=>setSupplierChannel(name,ck==='none'?null:ck)}
-                                  title={cs.label}
-                                  style={{flex:1,display:'inline-flex',alignItems:'center',justifyContent:'center',gap:4,padding:'5px 6px',borderRadius:4,fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit',whiteSpace:'nowrap',
-                                    background:active?cs.bg:'transparent',
-                                    color:active?cs.color:'var(--text)',
-                                    border:'1px solid '+(active?cs.border:'var(--border)'),
-                                    opacity:active?1:.85,
-                                    transition:'all .12s'}}
-                                  onMouseEnter={(e)=>{if(!active){e.currentTarget.style.background='var(--hover)';e.currentTarget.style.opacity='1';}}}
-                                  onMouseLeave={(e)=>{if(!active){e.currentTarget.style.background='transparent';e.currentTarget.style.opacity='.85';}}}>
-                                  <span style={{fontSize:12}}>{cs.icon}</span>
-                                  <span>{cs.label}</span>
-                                </button>
-                              );
-                            })}
-                          </span>
+                        <div key={name} style={{display:'grid',gridTemplateColumns:'180px 150px 110px 110px 1fr 80px',gap:10,padding:'8px 14px',borderBottom:'1px solid var(--border)',alignItems:'center',fontSize:12,background:isDirty?'rgba(246,173,9,.06)':'transparent'}}>
+                          <span style={{color:'var(--text)',fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={name}>{name}</span>
+                          <select value={cur.cond} onChange={e=>onCondChange(e.target.value)}
+                            style={{padding:'5px 6px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit'}}>
+                            <option value="">— 미설정 —</option>
+                            {SUP_SHIP_CONDS.map(c=><option key={c} value={c}>{c}</option>)}
+                          </select>
+                          <input type="number" value={feeDisabled?'메모':cur.fee} disabled={feeDisabled}
+                            onChange={e=>updateEdit({fee:e.target.value})}
+                            placeholder="0" style={{padding:'5px 8px',background:feeDisabled?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                          <input type="number" value={thresholdEnabled?cur.threshold:''} disabled={!thresholdEnabled}
+                            onChange={e=>updateEdit({threshold:e.target.value})}
+                            placeholder={thresholdEnabled?'예: 50000':'-'}
+                            style={{padding:'5px 8px',background:!thresholdEnabled?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                          <input type="text" value={cur.memo} onChange={e=>updateEdit({memo:e.target.value})}
+                            placeholder={cur.cond==='수량별 차등'||cur.cond==='메모 확인'?'예: 1~3개 3000원, 4~6개 6000원':'(선택) 메모'}
+                            style={{padding:'5px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                          <button disabled={!isDirty||isSaving}
+                            onClick={()=>setSupplierShipping(name,cur)}
+                            style={{padding:'5px 8px',background:isDirty?'#2A478D':'var(--bg)',border:'1px solid '+(isDirty?'#2A478D':'var(--border)'),borderRadius:4,color:isDirty?'#fff':'var(--sub)',fontSize:10,fontWeight:700,cursor:isDirty&&!isSaving?'pointer':'default',fontFamily:'inherit',opacity:isSaving?0.5:1}}>
+                            {isSaving?'저장중':isDirty?'저장':'완료'}
+                          </button>
                         </div>
                       );
                     })}
