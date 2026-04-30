@@ -189,6 +189,7 @@ const Icon = {
   agents:    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>,
   attendance:<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><polyline points="9 16 11 18 15 14"/></svg>,
   products:  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>,
+  suppliers: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 3h5v5"/><path d="M21 3l-7 7"/><path d="M8 21H3v-5"/><path d="M3 21l7-7"/><circle cx="12" cy="12" r="3"/></svg>,
 };
 
 function ChartComp({ type, data, options }) {
@@ -3200,6 +3201,311 @@ function ProductsPage({isCrew=false,isMaster=false,isManager=false}){
 }
 
 
+// ── SUPPLIERS MANAGEMENT PAGE ───────────────────
+function SuppliersPage({isCrew=false,isMaster=false,isManager=false}){
+  const canManage = isMaster || isManager;
+  const [suppliers,setSuppliers]=useState([]);     // [{name,channel,fee,cond,threshold,memo}]
+  const [productCounts,setProductCounts]=useState({}); // {supplier_name: count}
+  const [loading,setLoading]=useState(true);
+  const [search,setSearch]=useState('');
+  const [sortBy,setSortBy]=useState('name');       // name | products_desc | products_asc | unset_first
+  const [filterChannel,setFilterChannel]=useState('all'); // all|kakao|nateon|email|none
+  const [filterCond,setFilterCond]=useState('all');       // all|unset|<cond>
+  const [edit,setEdit]=useState({});               // 인라인 편집 임시 상태 {name: {fee,cond,threshold,memo}}
+  const [saving,setSaving]=useState(null);
+
+  // Constants 재사용 (ProductsPage와 동일하게 자기 충족적)
+  const SUP_CHANNELS={
+    kakao:  {label:'카카오톡', icon:'💬', bg:'#F6AD09', color:'#3A2E00', border:'#D89400'},
+    nateon: {label:'네이트온', icon:'📨', bg:'#A89AE0', color:'#2D1F66', border:'#8B7BCC'},
+    email:  {label:'메일',     icon:'✉️', bg:'#A8DEF6', color:'#0F4A6B', border:'#7AC4E8'},
+    none:   {label:'미설정',   icon:'⚪', bg:'#dce8ff', color:'#1a3a8f', border:'#b4ccf0'},
+  };
+  const SUP_SHIP_CONDS=['무료','고정 배송비','금액 조건부 무료','수량 비례','수량별 차등','금액별 차등','무게별 차등','메모 확인'];
+  const memoConds=['메모 확인','수량별 차등','금액별 차등','무게별 차등'];
+
+  // 데이터 로드: suppliers 전체 + products별 공급사명 카운트
+  const loadAll=async()=>{
+    setLoading(true);
+    // 1. suppliers 테이블
+    const{data:supRows}=await sb.from('suppliers').select('name,channel,default_shipping_fee,default_shipping_cond,default_shipping_threshold,shipping_memo,updated_at');
+    const supList=(supRows||[]).map(s=>({
+      name:s.name,
+      channel:s.channel||null,
+      fee:s.default_shipping_fee,
+      cond:s.default_shipping_cond||'',
+      threshold:s.default_shipping_threshold,
+      memo:s.shipping_memo||'',
+      updated_at:s.updated_at,
+    }));
+    // 2. products 테이블에서 supplier_name 카운트 (페이지네이션)
+    const counts={};
+    let from=0; const PAGE=1000;
+    while(true){
+      const{data:prodRows}=await sb.from('products').select('supplier_name').range(from,from+PAGE-1);
+      if(!prodRows||prodRows.length===0) break;
+      prodRows.forEach(p=>{
+        const n=(p.supplier_name||'').trim();
+        if(n) counts[n]=(counts[n]||0)+1;
+      });
+      if(prodRows.length<PAGE) break;
+      from+=PAGE;
+    }
+    // products에 있지만 suppliers에 없는 공급사도 목록에 포함
+    const knownNames=new Set(supList.map(s=>s.name));
+    Object.keys(counts).forEach(n=>{
+      if(!knownNames.has(n)) supList.push({name:n,channel:null,fee:null,cond:'',threshold:null,memo:'',updated_at:null});
+    });
+    setSuppliers(supList);
+    setProductCounts(counts);
+    setLoading(false);
+  };
+  useEffect(()=>{loadAll();},[]);
+
+  // 채널 변경 (즉시 저장)
+  const updateChannel=async(name,channel)=>{
+    if(!canManage){alert('권한이 없습니다 (master/manager 전용)');return;}
+    setSuppliers(prev=>prev.map(s=>s.name===name?{...s,channel}:s));
+    const{error}=await sb.from('suppliers').upsert({name,channel,updated_at:new Date().toISOString()},{onConflict:'name'});
+    if(error){alert('채널 저장 실패: '+error.message); loadAll();}
+  };
+  // 배송비 저장
+  const updateShipping=async(name,shipping)=>{
+    if(!canManage){alert('권한이 없습니다 (master/manager 전용)');return;}
+    setSaving(name);
+    const fee = shipping.cond==='메모 확인' ? null : (shipping.fee===''||shipping.fee==null?null:Number(shipping.fee));
+    const threshold = shipping.cond==='금액 조건부 무료' ? (shipping.threshold===''||shipping.threshold==null?null:Number(shipping.threshold)) : null;
+    const memo = memoConds.includes(shipping.cond) ? (shipping.memo||null) : null;
+    const payload = {
+      name,
+      default_shipping_fee:fee,
+      default_shipping_cond:shipping.cond||null,
+      default_shipping_threshold:threshold,
+      shipping_memo:memo,
+      updated_at:new Date().toISOString(),
+    };
+    setSuppliers(prev=>prev.map(s=>s.name===name?{...s,fee,cond:shipping.cond||'',threshold,memo:memo||''}:s));
+    const{error}=await sb.from('suppliers').upsert(payload,{onConflict:'name'});
+    setSaving(null);
+    if(error){alert('배송비 저장 실패: '+error.message); loadAll();}
+    else setEdit(prev=>{const n={...prev}; delete n[name]; return n;});
+  };
+
+  // 통계 (KPI)
+  const total = suppliers.length;
+  const channelUnsetCount = suppliers.filter(s=>!s.channel).length;
+  const condUnsetCount = suppliers.filter(s=>!s.cond).length;
+
+  // 필터/정렬 적용
+  const filtered=suppliers.filter(s=>{
+    if(search&&!s.name.toLowerCase().includes(search.toLowerCase())) return false;
+    if(filterChannel!=='all'){
+      if(filterChannel==='none') {if(s.channel) return false;}
+      else if(s.channel!==filterChannel) return false;
+    }
+    if(filterCond!=='all'){
+      if(filterCond==='unset') {if(s.cond) return false;}
+      else if(s.cond!==filterCond) return false;
+    }
+    return true;
+  });
+  const sorted=[...filtered].sort((a,b)=>{
+    if(sortBy==='name') return a.name.localeCompare(b.name,'ko');
+    if(sortBy==='products_desc') return (productCounts[b.name]||0)-(productCounts[a.name]||0);
+    if(sortBy==='products_asc')  return (productCounts[a.name]||0)-(productCounts[b.name]||0);
+    if(sortBy==='unset_first'){
+      const ax=(!a.channel||!a.cond)?0:1;
+      const bx=(!b.channel||!b.cond)?0:1;
+      if(ax!==bx) return ax-bx;
+      return a.name.localeCompare(b.name,'ko');
+    }
+    return 0;
+  });
+
+  // 배송비 cond별 카운트 (필터 옵션 표시용)
+  const condCounts={};
+  SUP_SHIP_CONDS.forEach(c=>{condCounts[c]=0;});
+  let condUnset=0;
+  suppliers.forEach(s=>{
+    if(!s.cond) condUnset++;
+    else if(condCounts[s.cond]!==undefined) condCounts[s.cond]++;
+  });
+  // 채널별 카운트
+  const chCounts={
+    all:total,
+    kakao:suppliers.filter(s=>s.channel==='kakao').length,
+    nateon:suppliers.filter(s=>s.channel==='nateon').length,
+    email:suppliers.filter(s=>s.channel==='email').length,
+    none:channelUnsetCount,
+  };
+
+  if(loading) return <div style={{padding:30,textAlign:'center',color:'var(--sub)'}}>📦 공급사 정보 로드 중...</div>;
+
+  return (
+    <div style={{padding:'20px 28px'}}>
+      {/* 페이지 헤더 */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-end',marginBottom:18}}>
+        <div>
+          <h1 style={{fontSize:18,fontWeight:700,color:'var(--text)',margin:0,marginBottom:4}}>공급사 관리</h1>
+          <div style={{fontSize:11,color:'var(--sub)'}}>
+            공급사별 소통 채널과 기본 배송비를 관리합니다
+            {!canManage&&<span style={{color:'#F6AD09',marginLeft:8}}>· 읽기 전용 (master/manager만 편집 가능)</span>}
+          </div>
+        </div>
+      </div>
+
+      {/* KPI */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3, 1fr)',gap:12,marginBottom:18}}>
+        <div style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:8,padding:'14px 18px'}}>
+          <div style={{fontSize:11,color:'var(--sub)',marginBottom:4}}>총 공급사</div>
+          <div style={{fontSize:22,color:'var(--text)',fontWeight:700}}>{total}<span style={{fontSize:12,color:'var(--sub)',fontWeight:400,marginLeft:4}}>개</span></div>
+        </div>
+        <div style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:8,padding:'14px 18px'}}>
+          <div style={{fontSize:11,color:'var(--sub)',marginBottom:4}}>채널 미설정</div>
+          <div style={{fontSize:22,color:channelUnsetCount>0?'#F6AD09':'var(--text)',fontWeight:700}}>{channelUnsetCount}<span style={{fontSize:12,color:'var(--sub)',fontWeight:400,marginLeft:4}}>개</span></div>
+        </div>
+        <div style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:8,padding:'14px 18px'}}>
+          <div style={{fontSize:11,color:'var(--sub)',marginBottom:4}}>배송비 미설정</div>
+          <div style={{fontSize:22,color:condUnsetCount>0?'#F6AD09':'var(--text)',fontWeight:700}}>{condUnsetCount}<span style={{fontSize:12,color:'var(--sub)',fontWeight:400,marginLeft:4}}>개</span></div>
+        </div>
+      </div>
+
+      {/* 검색 + 정렬 + 필터 */}
+      <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}}>
+        <input type="text" placeholder="공급사명 검색..." value={search} onChange={e=>setSearch(e.target.value)}
+          style={{flex:'1 1 220px',minWidth:200,padding:'8px 12px',background:'var(--card)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit',outline:'none'}}/>
+        <select value={sortBy} onChange={e=>setSortBy(e.target.value)}
+          style={{padding:'8px 10px',background:'var(--card)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit'}}>
+          <option value="name">정렬: 이름순 (가나다)</option>
+          <option value="products_desc">정렬: 상품수 ↓ (많은 순)</option>
+          <option value="products_asc">정렬: 상품수 ↑ (적은 순)</option>
+          <option value="unset_first">정렬: 미설정 우선</option>
+        </select>
+        <select value={filterChannel} onChange={e=>setFilterChannel(e.target.value)}
+          style={{padding:'8px 10px',background:'var(--card)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit'}}>
+          <option value="all">채널: 전체 ({chCounts.all})</option>
+          <option value="kakao">카카오톡 ({chCounts.kakao})</option>
+          <option value="nateon">네이트온 ({chCounts.nateon})</option>
+          <option value="email">메일 ({chCounts.email})</option>
+          <option value="none">미설정 ({chCounts.none})</option>
+        </select>
+        <select value={filterCond} onChange={e=>setFilterCond(e.target.value)}
+          style={{padding:'8px 10px',background:'var(--card)',border:'1px solid var(--border)',borderRadius:6,color:'var(--text)',fontSize:12,fontFamily:'inherit'}}>
+          <option value="all">배송조건: 전체 ({total})</option>
+          <option value="unset">미설정 ({condUnset})</option>
+          {SUP_SHIP_CONDS.map(c=><option key={c} value={c}>{c} ({condCounts[c]})</option>)}
+        </select>
+      </div>
+
+      {/* 결과 카운트 */}
+      <div style={{fontSize:11,color:'var(--sub)',marginBottom:8}}>
+        {sorted.length===total?`전체 ${total}개 공급사`:`${sorted.length}개 / 전체 ${total}개 공급사`}
+      </div>
+
+      {/* 공급사 테이블 */}
+      {sorted.length===0?(
+        <div style={{padding:40,textAlign:'center',color:'var(--sub)',background:'var(--card)',border:'1px solid var(--border)',borderRadius:8}}>
+          조건에 해당하는 공급사가 없습니다
+        </div>
+      ):(
+        <div style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:8,overflow:'hidden'}}>
+          {/* 헤더 */}
+          <div style={{display:'grid',gridTemplateColumns:'170px 70px 280px 130px 100px 100px 1fr 70px',gap:10,padding:'10px 14px',background:'#162244',color:'var(--sub)',fontSize:10,fontWeight:700,textTransform:'uppercase',letterSpacing:'.04em',borderBottom:'1px solid var(--border)'}}>
+            <span>공급사명</span>
+            <span style={{textAlign:'right'}}>상품수</span>
+            <span>채널</span>
+            <span>배송 조건</span>
+            <span>배송비(원)</span>
+            <span>구매 금액 조건(원)</span>
+            <span>메모</span>
+            <span>저장</span>
+          </div>
+          {/* 행 */}
+          {sorted.map(s=>{
+            const cur=edit[s.name]||{cond:s.cond||'',fee:s.fee==null?'':s.fee,threshold:s.threshold==null?'':s.threshold,memo:s.memo||''};
+            const isDirty=!!edit[s.name];
+            const isSaving=saving===s.name;
+            const memoEnabled=memoConds.includes(cur.cond);
+            const feeDisabled=cur.cond==='메모 확인';
+            const thresholdEnabled=cur.cond==='금액 조건부 무료';
+            const updateEdit=(patch)=>setEdit(prev=>({...prev,[s.name]:{...cur,...patch}}));
+            const onCondChange=(newCond)=>{
+              const patch={cond:newCond};
+              if(newCond==='메모 확인') patch.fee='';
+              if(newCond!=='금액 조건부 무료') patch.threshold='';
+              if(!memoConds.includes(newCond)) patch.memo='';
+              updateEdit(patch);
+            };
+            const productCount=productCounts[s.name]||0;
+            const curCh=s.channel||'none';
+            const curChStyle=SUP_CHANNELS[curCh];
+            return (
+              <div key={s.name} style={{display:'grid',gridTemplateColumns:'170px 70px 280px 130px 100px 100px 1fr 70px',gap:10,padding:'8px 14px',borderBottom:'1px solid var(--border)',alignItems:'center',fontSize:12,background:isDirty?'rgba(246,173,9,.06)':'transparent'}}>
+                <span style={{color:'var(--text)',fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={s.name}>{s.name}</span>
+                <span style={{textAlign:'right',color:productCount>0?'var(--text)':'var(--sub)',fontVariantNumeric:'tabular-nums',fontSize:11}}>{productCount.toLocaleString()}</span>
+                {/* 채널: 4개 버튼 */}
+                <span style={{display:'flex',gap:3}}>
+                  {['kakao','nateon','email','none'].map(ck=>{
+                    const cs=SUP_CHANNELS[ck];
+                    const active=curCh===ck;
+                    return (
+                      <button key={ck} onClick={()=>canManage&&updateChannel(s.name,ck==='none'?null:ck)}
+                        disabled={!canManage}
+                        title={cs.label}
+                        style={{flex:1,display:'inline-flex',alignItems:'center',justifyContent:'center',gap:3,padding:'4px 4px',borderRadius:3,fontSize:10,fontWeight:600,cursor:canManage?'pointer':'default',fontFamily:'inherit',whiteSpace:'nowrap',
+                          background:active?cs.bg:'transparent',
+                          color:active?cs.color:'var(--text)',
+                          border:'1px solid '+(active?cs.border:'var(--border)'),
+                          opacity:active?1:(canManage?.85:.5),
+                          transition:'all .12s'}}>
+                        <span style={{fontSize:11}}>{cs.icon}</span>
+                        <span>{cs.label}</span>
+                      </button>
+                    );
+                  })}
+                </span>
+                {/* 배송 조건 */}
+                <select value={cur.cond} onChange={e=>canManage&&onCondChange(e.target.value)} disabled={!canManage}
+                  style={{padding:'5px 6px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',opacity:canManage?1:.5}}>
+                  <option value="">— 미설정 —</option>
+                  {SUP_SHIP_CONDS.map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+                {/* 배송비 */}
+                <input type="number" value={feeDisabled?'메모':cur.fee} disabled={feeDisabled||!canManage}
+                  onChange={e=>canManage&&updateEdit({fee:e.target.value})}
+                  placeholder="0"
+                  style={{padding:'5px 8px',background:(feeDisabled||!canManage)?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                {/* 구매 금액 조건 */}
+                <input type="number" value={thresholdEnabled?cur.threshold:''} disabled={!thresholdEnabled||!canManage}
+                  onChange={e=>canManage&&updateEdit({threshold:e.target.value})}
+                  placeholder={thresholdEnabled?'예: 50000':'-'}
+                  style={{padding:'5px 8px',background:(!thresholdEnabled||!canManage)?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                {/* 메모 */}
+                <input type="text" value={memoEnabled?cur.memo:''} disabled={!memoEnabled||!canManage}
+                  onChange={e=>canManage&&updateEdit({memo:e.target.value})}
+                  placeholder={
+                    cur.cond==='수량별 차등'?'예: 1~3개 3000원, 4~6개 6000원':
+                    cur.cond==='금액별 차등'?'예: 5만원 미만 3000원, 5~10만원 2000원':
+                    cur.cond==='무게별 차등'?'예: 1kg 이하 3000원, 1~5kg 5000원':
+                    cur.cond==='메모 확인'?'직접 메모 입력':'-'
+                  }
+                  style={{padding:'5px 8px',background:(!memoEnabled||!canManage)?'#1a2240':'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--text)',fontSize:11,fontFamily:'inherit',outline:'none',width:'100%'}}/>
+                {/* 저장 */}
+                <button disabled={!canManage||!isDirty||isSaving}
+                  onClick={()=>updateShipping(s.name,cur)}
+                  style={{padding:'5px 8px',background:isDirty&&canManage?'#2A478D':'var(--bg)',border:'1px solid '+(isDirty&&canManage?'#2A478D':'var(--border)'),borderRadius:4,color:isDirty&&canManage?'#fff':'var(--sub)',fontSize:10,fontWeight:700,cursor:(canManage&&isDirty&&!isSaving)?'pointer':'default',fontFamily:'inherit',opacity:isSaving?0.5:1}}>
+                  {isSaving?'저장중':isDirty?'저장':'완료'}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── HISTORY (legacy - unused) ──────────────────
 function HistoryPage({ onEdit }) {
   const [opsMap,setOpsMap]=useState({}); const [agents,setAgents]=useState([]); const [allDates,setAllDates]=useState([]); const [loading,setLoading]=useState(true);
@@ -3268,6 +3574,7 @@ function App() {
             {id:'dashboard',label:'대시보드',icon:Icon.dashboard},
             {id:'entry',label:'데이터 입력',icon:Icon.entry},
             {id:'products',label:'상품 정보',icon:Icon.products},
+            {id:'suppliers',label:'공급사 관리',icon:Icon.suppliers},
           ].map(m=>(
             <div key={m.id} className={`nav-item ${page===m.id?'active':''}`} onClick={()=>{setPage(m.id);setEditDate(null);}}>
               {m.icon}{m.label}
@@ -3301,6 +3608,7 @@ function App() {
         {page==='dashboard'&&<DashboardPage/>}
         {page==='entry'&&isMaster&&<EntryPage editDate={editDate} onSaved={afterSave}/>}
         {page==='products'&&<ProductsPage isCrew={isCrew} isMaster={isMaster} isManager={isManager}/>}
+        {page==='suppliers'&&<SuppliersPage isCrew={isCrew} isMaster={isMaster} isManager={isManager}/>}
         {page==='agents'&&isMaster&&<AgentMgmtPage/>}
       </div>
     </div>
