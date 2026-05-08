@@ -1,0 +1,73 @@
+name: Cafe24 - Notify App Token Exchange (One-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      auth_code:
+        description: 'Auth Code from OAuth redirect (10분 내 사용)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  exchange:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exchange Auth Code for Tokens
+        env:
+          MALL_ID: ${{ secrets.CAFE24_MALL_ID }}
+          CLIENT_ID: ${{ secrets.NOTIFY_CAFE24_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.NOTIFY_CAFE24_CLIENT_SECRET }}
+          AUTH_CODE: ${{ inputs.auth_code }}
+          GH_TOKEN: ${{ secrets.PAT_FOR_SECRETS }}
+        run: |
+          set -e
+          echo "🔄 Auth Code → Token 교환 중..."
+          
+          AUTH_HEADER=$(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64 -w0)
+          
+          RESPONSE=$(curl -sS -X POST \
+            "https://${MALL_ID}.cafe24api.com/api/v2/oauth/token" \
+            -H "Authorization: Basic ${AUTH_HEADER}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=authorization_code" \
+            -d "code=${AUTH_CODE}" \
+            -d "redirect_uri=https://jenny287.github.io/oneroom-cs/")
+          
+          if echo "$RESPONSE" | grep -q "access_token"; then
+            ACCESS_TOKEN=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
+            REFRESH_TOKEN=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['refresh_token'])")
+            EXPIRES_AT=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['expires_at'])")
+            REFRESH_EXPIRES_AT=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['refresh_token_expires_at'])")
+            
+            echo "✅ Token 교환 성공"
+            echo "   - Access Token 만료: $EXPIRES_AT"
+            echo "   - Refresh Token 만료: $REFRESH_EXPIRES_AT"
+            
+            echo "::add-mask::$ACCESS_TOKEN"
+            echo "::add-mask::$REFRESH_TOKEN"
+            
+            echo "💾 GitHub Secrets에 저장 중..."
+            echo -n "$ACCESS_TOKEN" | gh secret set NOTIFY_CAFE24_ACCESS_TOKEN --repo "${{ github.repository }}"
+            echo -n "$REFRESH_TOKEN" | gh secret set NOTIFY_CAFE24_REFRESH_TOKEN --repo "${{ github.repository }}"
+            echo -n "$EXPIRES_AT" | gh secret set NOTIFY_CAFE24_TOKEN_EXPIRES_AT --repo "${{ github.repository }}"
+            echo "✅ Secrets 저장 완료"
+            echo ""
+            echo "다음 Secrets가 등록됨:"
+            echo "  - NOTIFY_CAFE24_ACCESS_TOKEN"
+            echo "  - NOTIFY_CAFE24_REFRESH_TOKEN"
+            echo "  - NOTIFY_CAFE24_TOKEN_EXPIRES_AT"
+          else
+            echo "❌ Token 교환 실패!"
+            echo "Response: $RESPONSE"
+            echo ""
+            echo "흔한 원인:"
+            echo "  1. Auth Code가 만료됨 (10분 초과) — 처음부터 다시"
+            echo "  2. Auth Code가 이미 사용됨 — 새 Code 발급 필요"
+            echo "  3. Client ID/Secret이 잘못 등록됨"
+            echo "  4. Redirect URI가 OAuth 앱 설정과 다름"
+            exit 1
+          fi
